@@ -25,7 +25,7 @@ LOG = logging.getLogger(__name__)
 
 # Setup a config group
 cfg.CONF.register_group(cfg.OptGroup(
-    name='handler:sample',
+    name='handler:instance_fqdn',
     title="Configuration for Sample Notification Handler"
 ))
 
@@ -33,14 +33,14 @@ cfg.CONF.register_group(cfg.OptGroup(
 cfg.CONF.register_opts([
     cfg.StrOpt('control-exchange', default='nova'),
     cfg.ListOpt('notification-topics', default=['designate']),
-    cfg.StrOpt('zone-name', default='example.org.'),
-    cfg.StrOpt('zone-id', default='12345'),
-], group='handler:sample')
+    cfg.ListOpt('exclude-projects', default=[]),
+    cfg.ListOpt('exclude-zones', default=[]),
+], group='handler:instance_fqdn')
 
 
-class SampleHandler(NotificationHandler):
+class InstanceFQDNHandler(NotificationHandler):
     """Sample Handler"""
-    __plugin_name__ = 'sample'
+    __plugin_name__ = 'instance_fqdn'
 
     def get_exchange_topics(self):
         """
@@ -53,24 +53,34 @@ class SampleHandler(NotificationHandler):
 
     def get_event_types(self):
         return [
-            'compute.instance.create.end'
+            'compute.instance.create.end',
+            'compute.instance.delete.start'
         ]
 
-    def process_notification(self, context, event_type, payload):
-        # Do something with the notification.. e.g:
-        zone_id = cfg.CONF[self.name].zone_id
-        zone_name = cfg.CONF[self.name].zone_name
+    def _get_tenant_zones(self, context, tenant_id):
+        exclude_zones = cfg.CONF[self.name].exclude_zones
+        zones = self.central_api.find_zones(
+            criterion={'tenant_id': tenant_id})
+        valid_zones = [x for x in zones if not x.name[:-1] in exclude_zones]
+        valid_zones.sort(key=lambda x: x.name, reverse=True)
+        return valid_zones
 
-        record_name = '%s.%s' % (payload['instance_id'], zone_name)
+    def _create(self, context, tenant_zones, instance_name, fixed_ips):
+        selected_zone = None
+        for z in tenant_zones:
+            if instance_name.endswith(z.name[:-1]):
+                selected_zone = z
+                break
 
-        context = DesignateContext().elevated()
-        context.all_tenants = True
-        # context.edit_managed_records = True
+        if not selected_zone:
+            LOG.debug('no valid zone for instance %s found in %s', 
+                      record_name, tenant_zones)
+            return
 
-        for fixed_ip in payload['fixed_ips']:
+        for fixed_ip in fixed_ips:
             recordset_values = {
-                'zone_id': zone_id,
-                'name': record_name,
+                'zone_id': z.id,
+                'name': instance_name,
                 'type': 'A' if fixed_ip['version'] == 4 else 'AAAA'
             }
 
@@ -78,6 +88,37 @@ class SampleHandler(NotificationHandler):
                 'data': fixed_ip['address'],
             }
 
+            LOG.info('creating record for instance %s with value %s',
+                     instance_name, fixed_ip['address'])
             self._create_or_update_recordset(
                 context, [Record(**record_values)], **recordset_values
             )
+
+    def _delete(self, context, tenant_zones, instance_name):
+        LOG.error('_delete not implemented')
+        return
+    
+    def process_notification(self, context, event_type, payload):
+        exclude_projects = cfg.CONF[self.name].exclude_projects
+        LOG.debug('handling notification payload %s', payload)
+
+        tenant_id = payload['tenant_id']
+        record_name = payload['display_name']
+        fixed_ips = payload['fixed_ips']
+
+        if tenant_id in exclude_projects:
+            LOG.debug('skipping notification, project(%s) in '
+                      'exclude_projects(%s)', tenant_id,
+                      exclude_projects, payload)
+            return
+
+        elevated_context = DesignateContext().elevated(all_tenants=True)
+        tenant_zones = self._get_tenant_zones(elevated_context, tenant_id)
+
+        if event_type == "compute.instance.create.end":
+            self._create(context, tenant_zones, record_name,
+                                fixed_ips)
+        elif event_type == "compute.instance.delete.start":
+            self._delete(context, tenant_zones, record_name)
+        else
+            LOG.warning('unknown event_type %s', event_type)

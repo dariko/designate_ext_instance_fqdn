@@ -1,4 +1,4 @@
-Sample Designate Notification Handler Extension
+Instance FQDN Notification Handler Extension
 ===============================================
 
-This repo provides a sample plugin for a custom notification handler.
+This handler
